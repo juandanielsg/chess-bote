@@ -1,0 +1,50 @@
+[project]
+name = "chess-bote"
+version = "0.1.0"
+description = "A chess engine written in Python"
+readme = "README.md"
+authors = [
+    { name = "juandanielsg", email = "jdsglez@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+chess-bote = "chess_bote:main"
+chess-bote-bench = "chess_bote.bench:main"
+chess-bote-uci = "chess_bote.uci:main"
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/chess_bote"]
+cmake.build-type = "Release"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+# NNUE training (CPU PyTorch). Install with: uv sync --group train
+train = [
+    "torch>=2.2",
+    "numpy>=1.26",
+]
+
+# Use the CPU-only PyTorch wheels (no CUDA) to keep the install small.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+addopts = "-m 'not slow'"
+markers = [
+    "slow: deeper perft cases (run with `-m slow`)",
+]
