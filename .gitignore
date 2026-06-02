@@ -15,5 +15,7 @@ matches/
 
 # NNUE training artifacts (regenerable; keep the repo source-only)
 nnue/data/
+nnue/loop_runs/
+nnue/optionc_runs/
 *.bin
 *.pt

@@ -107,6 +107,12 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--out", default="nnue/net.pt")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--label",
+        choices=["cp", "wdl"],
+        default="cp",
+        help="label type: 'cp' (Stockfish eval) or 'wdl' (self-play outcome 0/0.5/1)",
+    )
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -122,16 +128,17 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         total = 0.0
         n = 0
-        for indices, offsets, cp in dl:
+        for indices, offsets, value in dl:
             pred = model(indices, offsets)
-            target_wdl = torch.sigmoid(cp / WDL_SCALE)
+            # 'cp' labels are centipawns -> map to win prob; 'wdl' labels already are.
+            target_wdl = value if args.label == "wdl" else torch.sigmoid(value / WDL_SCALE)
             pred_wdl = torch.sigmoid(pred / WDL_SCALE)
             loss = loss_fn(pred_wdl, target_wdl)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += loss.item() * len(cp)
-            n += len(cp)
+            total += loss.item() * len(value)
+            n += len(value)
         print(f"epoch {epoch:3d}  wdl-mse {total / n:.5f}", file=sys.stderr)
 
     torch.save(model.state_dict(), args.out)

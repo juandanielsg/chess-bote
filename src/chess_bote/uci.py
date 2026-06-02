@@ -70,6 +70,8 @@ class UCIEngine:
                 native.new_game()
             else:
                 self.searcher.tt.clear()
+        elif cmd == "setoption":
+            self._cmd_setoption(tokens)
         elif cmd == "position":
             self._stop_search()
             self._cmd_position(tokens)
@@ -90,8 +92,27 @@ class UCIEngine:
     def _cmd_uci(self) -> None:
         self._send(f"id name {ENGINE_NAME}")
         self._send(f"id author {ENGINE_AUTHOR}")
-        # (No configurable options yet.)
+        # NNUE net path; "handcrafted" (or empty) uses the hand-crafted eval.
+        self._send("option name EvalFile type string default handcrafted")
         self._send("uciok")
+
+    def _cmd_setoption(self, tokens: list[str]) -> None:
+        if "name" not in tokens:
+            return
+        ni = tokens.index("name")
+        if "value" in tokens:
+            vi = tokens.index("value")
+            name = " ".join(tokens[ni + 1 : vi])
+            value = " ".join(tokens[vi + 1 :])
+        else:
+            name, value = " ".join(tokens[ni + 1 :]), ""
+
+        if name.lower() == "evalfile":
+            v = value.strip()
+            if v == "" or v.lower() in ("handcrafted", "none", "<empty>"):
+                native.set_nnue(False)
+            elif not native.load_nnue(v):
+                self._send(f"info string failed to load EvalFile: {v}")
 
     def _cmd_position(self, tokens: list[str]) -> None:
         idx = 1

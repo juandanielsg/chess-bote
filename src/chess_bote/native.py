@@ -61,6 +61,17 @@ def native_search(
     )
 
 
+def load_nnue(path: str) -> bool:
+    """Load a quantized NNUE and switch eval to it. Returns success."""
+    return bool(HAS_NATIVE and _core.load_nnue(path))
+
+
+def set_nnue(on: bool) -> None:
+    """Toggle between NNUE (True) and hand-crafted (False) evaluation."""
+    if HAS_NATIVE:
+        _core.use_nnue(on)
+
+
 def stop() -> None:
     """Ask the running native search to stop (thread-safe)."""
     if HAS_NATIVE:
