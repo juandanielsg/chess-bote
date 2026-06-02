@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/chessbote-logo.png" alt="chess-bote logo" width="360">
+</p>
+
 # chess-bote
 
 A chess engine written in Python with a native C++ core. It speaks
