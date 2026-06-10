@@ -109,19 +109,22 @@ real champion and can only improve:
 
 ```bash
 START_CHAMPION="$PWD/nnue/net0.bin" \
-GENERATIONS=10 POSITIONS=200000 SELFPLAY_DEPTH=8 \
-EPOCHS=40 GATE_GAMES=60 GATE_TC=8+0.08 GATE_THRESH=0.53 JOBS=6 \
+GENERATIONS=10 POSITIONS=200000 SELFPLAY_NODES=8000 \
+EPOCHS=40 GATE_GAMES=200 GATE_NODES=20000 GATE_THRESH=0.53 JOBS=10 \
 scripts/nnue_loop.sh
 ```
 
 Each generation: self-play (with the champion) → train candidate → export →
-**gated 60-game match** vs the champion → promote only if it scores ≥ 53%.
+**gated 200-game match at fixed nodes** vs the champion → promote only if it
+scores ≥ 53%. Fixed-node gating measures eval quality, not eval speed, and is
+immune to machine-load noise (set `GATE_NODES=0` to gate on `GATE_TC` instead).
 The final champion is copied to `<RUN_DIR>/champion.bin`; per-generation logs,
 nets, and PGNs are kept under `nnue/loop_runs/<timestamp>/`.
 
 Notes:
-- **Deeper `SELFPLAY_DEPTH` = stronger outcome labels = bigger steps** (but
-  slower generation). 8 is a reasonable balance; 6 is faster but climbs slower.
+- **Higher `SELFPLAY_NODES` = stronger labels = bigger steps** (but slower
+  generation). Positions are labelled with both the game outcome and the
+  search score the engine computed for its move; `CP_MIX` blends them.
 - Expect **rejections**; that's the gate doing its job (no regressions). Net
   gains come from the *promoted* generations.
 - `DATA_WINDOW` (default 3) trains on the last N generations' data — a replay

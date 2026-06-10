@@ -1,22 +1,25 @@
-"""Generate WDL (outcome-based) NNUE training data via engine self-play.
+"""Generate WDL + search-score NNUE training data via engine self-play.
 
-chess-bote plays games against itself. Each game starts with a short random
-opening (for diversity) and is then played out with the engine's own search;
-positions from the engine-played phase are sampled and labelled with the
-**game result** (White-relative: 1.0 win / 0.5 draw / 0.0 loss).
+chess-bote plays games against itself, entirely inside the C++ core (the
+Python layer only fans games out over worker processes and writes the output).
+Each game starts with a short random opening (for diversity) and is then
+played out with the engine's own search; quiet positions from the
+engine-played phase are sampled and labelled with:
 
-This is the AlphaZero-flavoured signal: the label is the real outcome of the
-game, not any engine's evaluation. Two things to keep in mind:
+  * the **game result** (White-relative: 1.0 win / 0.5 draw / 0.0 loss) -- the
+    AlphaZero-flavoured outcome signal, noisy but unbiased, and
+  * the **search score** in centipawns (White-relative) -- the depth-N eval
+    the engine already computed to pick its move, a much stronger per-position
+    signal than any static eval.
 
-  * The label is noisy -- one win/draw/loss bit is shared by every sampled
-    position in the game -- so you need *many* positions for it to average out.
-  * The data's ceiling is roughly the strength of the engine generating it.
+"Quiet" means: not in check, best move is not a capture/promotion, and the
+score is not a forced mate -- a static net can't represent tactics-in-flight.
 
-Output: one record per line, ``<fen>|<wdl>`` with wdl in {0.0, 0.5, 1.0}.
-Train with ``train.py --label wdl``.
+Output: one record per line, ``<fen>|<wdl>|<cp>``.
+Train with ``train.py --label wdl`` (the cp column feeds --hce-mix).
 
 Usage:
-    uv run python nnue/gen_selfplay.py --count 500000 --depth 6 --jobs 6 \
+    uv run python nnue/gen_selfplay.py --count 500000 --nodes 5000 --jobs 10 \
         --out nnue/data/selfplay.txt
 """
 
@@ -24,95 +27,67 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import random
 import sys
 import time
 from multiprocessing import Pool
 from pathlib import Path
 
-from chess_bote import Board, find_best_move, native
-from chess_bote.movegen import generate_legal, in_check
-from chess_bote.types import Color, PieceType
+from tqdm import tqdm
+
+from chess_bote import native
 
 
-def _insufficient_material(board: Board) -> bool:
-    """True for trivially drawn material (KvK, KNvK, KBvK)."""
-    if board.piece_bb[PieceType.PAWN] or board.piece_bb[PieceType.ROOK] or board.piece_bb[PieceType.QUEEN]:
-        return False
-    minors = board.piece_bb[PieceType.KNIGHT] | board.piece_bb[PieceType.BISHOP]
-    return minors.bit_count() <= 1
-
-
-def _play_game(args: tuple) -> list[tuple[str, float]]:
-    game_id, depth, random_plies, sample_per_game, max_plies = args
-    rng = random.Random(game_id)
-    native.new_game()
-    board = Board()
-    history: dict[int, int] = {}
-    candidates: list[str] = []  # engine-played, not-in-check positions
-    result_white = 0.5  # default: draw
-
-    ply = 0
-    while True:
-        moves = generate_legal(board)
-        if not moves:
-            if in_check(board):  # checkmate: side to move loses
-                result_white = 0.0 if board.side_to_move == Color.WHITE else 1.0
-            break  # else stalemate -> draw
-        if board.halfmove_clock >= 100 or _insufficient_material(board):
-            break  # 50-move / material draw
-        key = board.zobrist_key
-        history[key] = history.get(key, 0) + 1
-        if history[key] >= 3 or ply >= max_plies:
-            break  # threefold / length cap -> draw
-
-        if ply < random_plies:
-            move = rng.choice(moves)
-        else:
-            if not in_check(board):
-                candidates.append(board.fen())
-            move = find_best_move(board, depth=depth).best_move
-            if move is None:
-                break
-        board.make_move(move)
-        ply += 1
-
-    rng.shuffle(candidates)
-    return [(fen, result_white) for fen in candidates[:sample_per_game]]
+def _play_game(args: tuple) -> list[tuple[str, float, int]]:
+    game_id, depth, nodes, random_plies, sample_per_game, max_plies = args
+    return native.selfplay_game(
+        game_id, depth, nodes, random_plies, sample_per_game, max_plies
+    )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Generate WDL self-play training data")
     ap.add_argument("--count", type=int, default=500000, help="positions to keep")
-    ap.add_argument("--depth", type=int, default=6, help="engine search depth per move")
+    ap.add_argument("--depth", type=int, default=12,
+                    help="max engine search depth per move")
+    ap.add_argument("--nodes", type=int, default=5000,
+                    help="node limit per move (0 = depth-limited only)")
     ap.add_argument("--random-plies", type=int, default=10, help="random opening length")
-    ap.add_argument("--sample-per-game", type=int, default=10)
+    ap.add_argument("--sample-per-game", type=int, default=20)
     ap.add_argument("--max-plies", type=int, default=300, help="game length cap")
     ap.add_argument("--jobs", type=int, default=1, help="parallel self-play workers")
     ap.add_argument("--out", type=str, default="nnue/data/selfplay.txt")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="first game id (keep runs disjoint: gen * 10_000_000)")
     args = ap.parse_args()
+
+    if not native.HAS_NATIVE:
+        sys.exit("native core not built; self-play requires it (run `uv build`)")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     def game_args():
         for gid in itertools.count(args.seed):
-            yield (gid, args.depth, args.random_plies, args.sample_per_game, args.max_plies)
+            yield (gid, args.depth, args.nodes, args.random_plies,
+                   args.sample_per_game, args.max_plies)
 
     written = 0
     games = 0
     start = time.perf_counter()
 
+    bar = tqdm(total=args.count, unit="pos", desc="self-play", file=sys.stderr)
+
     def record(f, batch):
         nonlocal written, games
         games += 1
-        for fen, wdl in batch:
-            f.write(f"{fen}|{wdl:.1f}\n")
+        n = 0
+        for fen, wdl, cp in batch:
+            f.write(f"{fen}|{wdl:.1f}|{cp}\n")
             written += 1
-        if games % 200 == 0:
-            rate = written / (time.perf_counter() - start)
-            print(f"  {written}/{args.count}  ({games} games, {rate:.0f} pos/s)", file=sys.stderr)
+            n += 1
+        bar.update(n)
+        rate = written / (time.perf_counter() - start)
+        bar.set_postfix(games=games, pos_s=f"{rate:.0f}")
 
     with out_path.open("w") as f:
         if args.jobs <= 1:
@@ -128,9 +103,10 @@ def main() -> None:
                         break
                 pool.terminate()
 
+    bar.close()
     elapsed = time.perf_counter() - start
     print(
-        f"wrote {written} positions from {games} games to {out_path} in {elapsed:.1f}s",
+        f"wrote {written:,} positions from {games:,} games to {out_path} in {elapsed:.1f}s",
         file=sys.stderr,
     )
 

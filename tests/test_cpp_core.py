@@ -67,10 +67,51 @@ def test_package_find_best_move_is_native_and_works():
 def test_native_info_callback_reports_each_depth_with_pv():
     _core.new_game()
     lines = []
-    _core.search(STARTPOS, 5, 0, lines.append)
+    _core.search(STARTPOS, 5, 0, info_callback=lines.append)
     # One info per completed depth, in increasing order.
     assert [d["depth"] for d in lines] == [1, 2, 3, 4, 5]
     last = lines[-1]
     assert {"depth", "score", "nodes", "time", "pv"} <= set(last)
     assert last["pv"] and last["pv"][0] == "e2e4" or len(last["pv"]) >= 1
     assert all(isinstance(m, str) for m in last["pv"])  # PV is UCI strings
+
+
+def test_native_search_respects_node_limit():
+    _core.new_game()
+    r = _core.search(STARTPOS, 64, 0, 5000)
+    assert r["bestmove"] != "0000"
+    # checkpoint() trips as soon as the budget is hit, so the overshoot is
+    # bounded by the nodes spent finishing the current depth-1 iteration.
+    assert r["nodes"] <= 5000 + 2048
+
+
+def test_native_selfplay_game_returns_labelled_quiet_positions():
+    records = _core.selfplay_game(1, 6, 2000, 10, 20, 300)
+    assert 0 < len(records) <= 20
+    wdls = {wdl for _, wdl, _ in records}
+    assert len(wdls) == 1 and wdls <= {0.0, 0.5, 1.0}
+    for fen, _, cp in records:
+        assert -3000 <= cp <= 3000
+        Board(fen)  # FEN must round-trip through the Python board
+    # Same game id is reproducible; a different one diverges.
+    assert _core.selfplay_game(1, 6, 2000, 10, 20, 300) == records
+    assert _core.selfplay_game(2, 6, 2000, 10, 20, 300) != records
+
+
+def test_nnue_incremental_accumulator_matches_refresh():
+    import pathlib
+
+    net = pathlib.Path(__file__).resolve().parent.parent / "nnue" / "net.bin"
+    if not net.exists():
+        pytest.skip("no quantized net available")
+    assert _core.load_nnue(str(net))
+    try:
+        # Walk the legal tree from tricky positions (castling, ep, promotions)
+        # comparing the incremental accumulator against a full refresh.
+        for fen in (STARTPOS, KIWIPETE, POSITION4, POSITION5):
+            assert _core.nnue_selfcheck(fen, 3)
+        # A node-limited self-play game exercises full games incrementally.
+        records = _core.selfplay_game(3, 6, 1000, 10, 20, 200)
+        assert records
+    finally:
+        _core.use_nnue(False)

@@ -11,18 +11,22 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <fstream>
 #include <functional>
 #include <cstdint>
 #include <random>
 #include <sstream>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace nb = nanobind;
@@ -78,6 +82,7 @@ Bitboard KING_ATT[64];
 Bitboard PAWN_ATT[2][64];
 Bitboard BETWEEN[64][64];
 Bitboard LINE[64][64];
+int LMR[64][64];  // LMR[depth][moveIndex] -> reduction
 
 Bitboard ROOK_MASK[64], BISHOP_MASK[64];
 Bitboard ROOK_MAGIC[64], BISHOP_MAGIC[64];
@@ -279,7 +284,29 @@ void initTables() {
     for (int i = 0; i < 16; ++i) ZOBRIST_CASTLE[i] = zrng();
     for (int i = 0; i < 8; ++i) ZOBRIST_EP[i] = zrng();
     ZOBRIST_SIDE = zrng();
+
+    for (int d = 0; d < 64; ++d)
+        for (int m = 0; m < 64; ++m)
+            LMR[d][m] = (d >= 2 && m >= 2)
+                        ? std::max(1, (int)(std::log(d) * std::log(m) / 2.0))
+                        : 0;
 }
+
+// --------------------------------------------------------------------------- //
+// NNUE weights (loaded from disk; declared before Board so the accumulator can
+// be updated incrementally inside put/remove)
+// --------------------------------------------------------------------------- //
+
+constexpr int NN_HIDDEN = 256;
+constexpr int NN_FEATURES = 768;
+constexpr int NN_QA = 255;
+constexpr int NN_QB = 64;
+
+bool gUseNnue = false;
+std::vector<int16_t> NN_FT_W;   // [NN_FEATURES * NN_HIDDEN], row-major (feature, hidden)
+std::vector<int16_t> NN_FT_B;   // [NN_HIDDEN]
+std::vector<int16_t> NN_OUT_W;  // [NN_HIDDEN]
+int64_t NN_OUT_B = 0;           // already scaled by QA*QB
 
 // --------------------------------------------------------------------------- //
 // Board
@@ -297,8 +324,14 @@ struct Board {
     int fullmove = 1;
     Bitboard zobrist = 0;
 
+    // NNUE accumulator, maintained incrementally by put/remove. Valid (and
+    // paid for) only while gUseNnue is set; eval just clamps + dots it.
+    alignas(64) int32_t acc[NN_HIDDEN];
+
     Board() {
         for (int i = 0; i < 64; ++i) mailbox[i] = NONE;
+        if (gUseNnue)
+            for (int h = 0; h < NN_HIDDEN; ++h) acc[h] = NN_FT_B[h];
     }
 
     inline Bitboard pieces(int color, int pt) const {
@@ -314,6 +347,10 @@ struct Board {
         occupied |= bb;
         mailbox[sq] = (uint8_t)pt;
         zobrist ^= ZOBRIST_PIECE[color][pt][sq];
+        if (gUseNnue) {
+            const int16_t* w = &NN_FT_W[(size_t)(color * 384 + pt * 64 + sq) * NN_HIDDEN];
+            for (int h = 0; h < NN_HIDDEN; ++h) acc[h] += w[h];
+        }
     }
     inline void remove(int color, int pt, int sq) {
         Bitboard bb = ~(1ULL << sq);
@@ -322,6 +359,10 @@ struct Board {
         occupied &= bb;
         mailbox[sq] = NONE;
         zobrist ^= ZOBRIST_PIECE[color][pt][sq];
+        if (gUseNnue) {
+            const int16_t* w = &NN_FT_W[(size_t)(color * 384 + pt * 64 + sq) * NN_HIDDEN];
+            for (int h = 0; h < NN_HIDDEN; ++h) acc[h] -= w[h];
+        }
     }
     inline void movePiece(int color, int pt, int from, int to) {
         remove(color, pt, from);
@@ -674,6 +715,52 @@ Board fromFen(const std::string& fen) {
     return b;
 }
 
+std::string toFen(const Board& b) {
+    static const char PIECE_CHARS[2][6] = {{'P', 'N', 'B', 'R', 'Q', 'K'},
+                                           {'p', 'n', 'b', 'r', 'q', 'k'}};
+    std::string fen;
+    for (int rank = 7; rank >= 0; --rank) {
+        int empty = 0;
+        for (int file = 0; file < 8; ++file) {
+            int sq = rank * 8 + file;
+            int pt = b.mailbox[sq];
+            if (pt == NONE) {
+                empty++;
+                continue;
+            }
+            if (empty) {
+                fen += (char)('0' + empty);
+                empty = 0;
+            }
+            int color = ((b.colorBB[BLACK] >> sq) & 1) ? BLACK : WHITE;
+            fen += PIECE_CHARS[color][pt];
+        }
+        if (empty) fen += (char)('0' + empty);
+        if (rank) fen += '/';
+    }
+    fen += (b.side == WHITE) ? " w " : " b ";
+    if (b.castling) {
+        if (b.castling & WHITE_OO) fen += 'K';
+        if (b.castling & WHITE_OOO) fen += 'Q';
+        if (b.castling & BLACK_OO) fen += 'k';
+        if (b.castling & BLACK_OOO) fen += 'q';
+    } else {
+        fen += '-';
+    }
+    fen += ' ';
+    if (b.epSquare != -1) {
+        fen += (char)('a' + (b.epSquare & 7));
+        fen += (char)('1' + (b.epSquare >> 3));
+    } else {
+        fen += '-';
+    }
+    fen += ' ';
+    fen += std::to_string(b.halfmove);
+    fen += ' ';
+    fen += std::to_string(b.fullmove);
+    return fen;
+}
+
 uint64_t perftRec(Board& b, int depth) {
     Move moves[256];
     int n = genLegal(b, moves);
@@ -782,20 +869,11 @@ int evaluateHandcrafted(const Board& b) {
 // NNUE evaluation
 // --------------------------------------------------------------------------- //
 //
-// v1 recomputes the accumulator from the board on every eval ("refresh"). It is
-// simple and correct, and serves as the oracle for the planned incremental
-// (efficiently-updatable) version. Feature index = color*384 + piece*64 + sq.
-
-constexpr int NN_HIDDEN = 256;
-constexpr int NN_FEATURES = 768;
-constexpr int NN_QA = 255;
-constexpr int NN_QB = 64;
-
-bool gUseNnue = false;
-std::vector<int16_t> NN_FT_W;   // [NN_FEATURES * NN_HIDDEN], row-major (feature, hidden)
-std::vector<int16_t> NN_FT_B;   // [NN_HIDDEN]
-std::vector<int16_t> NN_OUT_W;  // [NN_HIDDEN]
-int64_t NN_OUT_B = 0;           // already scaled by QA*QB
+// The accumulator lives in Board and is updated incrementally by put/remove
+// (a few 256-wide add/sub rows per move instead of a full recompute), so eval
+// itself is just clamp + dot product. refreshAccumulator() recomputes it from
+// scratch and serves as the correctness oracle (see nnue_selfcheck).
+// Feature index = color*384 + piece*64 + sq.
 
 bool loadNnue(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -817,8 +895,7 @@ bool loadNnue(const std::string& path) {
     return true;
 }
 
-int evaluateNnue(const Board& b) {
-    int32_t acc[NN_HIDDEN];
+void refreshAccumulator(const Board& b, int32_t* acc) {
     for (int h = 0; h < NN_HIDDEN; ++h) acc[h] = NN_FT_B[h];
     for (int color = 0; color < 2; ++color) {
         Bitboard cbb = b.colorBB[color];
@@ -833,6 +910,9 @@ int evaluateNnue(const Board& b) {
             }
         }
     }
+}
+
+inline int nnueOutput(const int32_t* acc, int side) {
     int64_t out = 0;
     for (int h = 0; h < NN_HIDDEN; ++h) {
         int a = acc[h];
@@ -841,8 +921,10 @@ int evaluateNnue(const Board& b) {
         out += (int64_t)NN_OUT_W[h] * a;
     }
     int cp = (int)((out + NN_OUT_B) / ((int64_t)NN_QA * NN_QB));  // trunc toward zero
-    return (b.side == WHITE) ? cp : -cp;
+    return (side == WHITE) ? cp : -cp;
 }
+
+inline int evaluateNnue(const Board& b) { return nnueOutput(b.acc, b.side); }
 
 int evaluate(const Board& b) {
     return gUseNnue ? evaluateNnue(b) : evaluateHandcrafted(b);
@@ -884,6 +966,7 @@ constexpr int MATE_THRESHOLD = MATE - 1000;
 constexpr int MAX_PLY = 256;
 constexpr int NULL_R = 2;
 constexpr int TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
+constexpr int ASPIRATION_DELTA = 50;
 
 struct TTEntry {
     Bitboard key = 0;
@@ -930,6 +1013,7 @@ using InfoFn =
 
 struct Searcher {
     uint64_t nodes = 0;
+    uint64_t maxNodes = 0;  // 0 = no node limit
     bool timeUp = false;
     bool useDeadline = false;
     std::atomic<bool> stopRequested{false};
@@ -973,6 +1057,7 @@ struct Searcher {
     }
 
     inline void checkpoint() {
+        if (maxNodes && nodes >= maxNodes) timeUp = true;
         if ((++nodes & 2047) == 0) {
             if (stopRequested.load(std::memory_order_relaxed))
                 timeUp = true;
@@ -1097,8 +1182,19 @@ struct Searcher {
             if (i == 0) {
                 score = -negamax(b, depth - 1, -beta, -alpha, ply + 1);
             } else {
-                score = -negamax(b, depth - 1, -alpha - 1, -alpha, ply + 1);
-                if (alpha < score && score < beta)
+                // LMR: quiet late moves get a reduced-depth null-window probe first.
+                int R = 0;
+                if (depth >= 3 && i >= 2 && !checked &&
+                    !mIsCapture(m) && !mIsPromo(m)) {
+                    R = LMR[std::min(depth, 63)][std::min(i, 63)];
+                    if (R > depth - 2) R = depth - 2;
+                }
+                score = -negamax(b, depth - 1 - R, -alpha - 1, -alpha, ply + 1);
+                // Reduced search beat alpha: re-search at full depth with null window.
+                if (!timeUp && score > alpha && R > 0)
+                    score = -negamax(b, depth - 1, -alpha - 1, -alpha, ply + 1);
+                // Null-window beat alpha in a PV node: confirm with full window.
+                if (!timeUp && score > alpha && score < beta)
                     score = -negamax(b, depth - 1, -beta, -alpha, ply + 1);
             }
             unmakeMove(b, m, u);
@@ -1126,7 +1222,8 @@ struct Searcher {
     }
 
     // Returns the root score; writes the best move to outMove.
-    int searchRoot(Board& b, int depth, Move orderHint, Move& outMove) {
+    // alpha/beta let the caller impose an aspiration window.
+    int searchRoot(Board& b, int depth, Move orderHint, Move& outMove, int alpha, int beta) {
         Move moves[256];
         int n = genLegal(b, moves);
         if (n == 0) {
@@ -1137,7 +1234,7 @@ struct Searcher {
         Move ttMove = (e.key == b.zobrist && e.move) ? e.move : orderHint;
         orderMoves(b, moves, n, 0, ttMove);
 
-        int alpha = -INF;
+        int best = -INF;
         Move localBest = moves[0];
         Undo u;
         for (int i = 0; i < n; ++i) {
@@ -1145,32 +1242,37 @@ struct Searcher {
             makeMove(b, m, u);
             int score;
             if (i == 0) {
-                score = -negamax(b, depth - 1, -INF, -alpha, 1);
+                score = -negamax(b, depth - 1, -beta, -alpha, 1);
             } else {
                 score = -negamax(b, depth - 1, -alpha - 1, -alpha, 1);
-                if (score > alpha) score = -negamax(b, depth - 1, -INF, -alpha, 1);
+                if (!timeUp && score > alpha && score < beta)
+                    score = -negamax(b, depth - 1, -beta, -alpha, 1);
             }
             unmakeMove(b, m, u);
             if (timeUp) break;
-            if (score > alpha) {
-                alpha = score;
+            if (score > best) {
+                best = score;
                 localBest = m;
+                if (best > alpha) alpha = best;
             }
+            if (alpha >= beta) break;
         }
-        // The root is exact; cache it for the next iteration's ordering.
+        // Cache at root for move ordering in the next iteration.
         e.key = b.zobrist;
         e.depth = depth;
-        e.score = scoreToTT(alpha, 0);
+        e.score = scoreToTT(best, 0);
         e.flag = TT_EXACT;
         e.move = localBest;
         outMove = localBest;
-        return alpha;
+        return best;
     }
 
-    SearchResult go(Board& b, int maxDepth, int movetimeMs, const InfoFn& onInfo) {
+    SearchResult go(Board& b, int maxDepth, int movetimeMs, uint64_t nodeLimit,
+                    const InfoFn& onInfo) {
         if (maxDepth > MAX_PLY - 16) maxDepth = MAX_PLY - 16;  // keep ply in bounds
         if (maxDepth < 1) maxDepth = 1;
         nodes = 0;
+        maxNodes = nodeLimit;
         timeUp = false;
         stopRequested.store(false, std::memory_order_relaxed);
         useDeadline = movetimeMs > 0;
@@ -1187,8 +1289,34 @@ struct Searcher {
         Move hint = 0;
 
         for (int depth = 1; depth <= maxDepth; ++depth) {
-            Move move;
-            int score = searchRoot(b, depth, hint, move);
+            Move move = hint;
+            int score;
+
+            if (depth >= 4) {
+                // Aspiration window: start narrow, widen exponentially on failure.
+                int delta = ASPIRATION_DELTA;
+                int alpha = std::max(-INF, bestScore - delta);
+                int beta  = std::min( INF, bestScore + delta);
+                while (true) {
+                    score = searchRoot(b, depth, hint, move, alpha, beta);
+                    if (timeUp) break;
+                    if (score <= alpha) {
+                        beta  = (alpha + beta + 1) / 2;
+                        alpha -= delta;
+                        if (alpha < -MATE) alpha = -INF;
+                        delta += delta / 2;
+                    } else if (score >= beta) {
+                        beta += delta;
+                        if (beta > MATE) beta = INF;
+                        delta += delta / 2;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                score = searchRoot(b, depth, hint, move, -INF, INF);
+            }
+
             if (timeUp) break;
             bestMove = move;
             bestScore = score;
@@ -1201,6 +1329,7 @@ struct Searcher {
                 onInfo(depth, bestScore, nodes, secs, reconstructPV(b, depth));
             }
             if (std::abs(bestScore) >= MATE_THRESHOLD) break;
+            if (maxNodes && nodes >= maxNodes) break;
             if (useDeadline && std::chrono::steady_clock::now() >= deadline) break;
         }
 
@@ -1220,7 +1349,7 @@ struct Searcher {
 Searcher gSearcher;
 
 nb::dict searchFen(const std::string& fen, int maxDepth, int movetimeMs,
-                   nb::object infoCallback) {
+                   uint64_t maxNodes, nb::object infoCallback) {
     Board b = fromFen(fen);
 
     // Optional per-depth callback. The search runs with the GIL released, so the
@@ -1246,7 +1375,7 @@ nb::dict searchFen(const std::string& fen, int maxDepth, int movetimeMs,
     {
         // Release the GIL so a UCI `stop` from another thread can interrupt us.
         nb::gil_scoped_release release;
-        r = gSearcher.go(b, maxDepth, movetimeMs, onInfo);
+        r = gSearcher.go(b, maxDepth, movetimeMs, maxNodes, onInfo);
     }
     nb::dict d;
     d["bestmove"] = r.bestMove ? moveToUci(r.bestMove) : std::string("0000");
@@ -1260,6 +1389,110 @@ nb::dict searchFen(const std::string& fen, int maxDepth, int movetimeMs,
 void stopSearch() { gSearcher.stopRequested.store(true, std::memory_order_relaxed); }
 
 void newGame() { gSearcher.clearTT(); }
+
+// --------------------------------------------------------------------------- //
+// Self-play data generation (the whole game loop runs natively)
+// --------------------------------------------------------------------------- //
+
+const char* START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+// Trivially drawn material: KvK, KNvK, KBvK.
+bool insufficientMaterial(const Board& b) {
+    if (b.pieceBB[PAWN] | b.pieceBB[ROOK] | b.pieceBB[QUEEN]) return false;
+    return popcount(b.pieceBB[KNIGHT] | b.pieceBB[BISHOP]) <= 1;
+}
+
+// Labels are capped here: mate scores are filtered out before this applies and
+// the trainer squashes cp through sigmoid(cp/400), which saturates anyway.
+constexpr int SELFPLAY_CP_CAP = 3000;
+
+// Play one self-play game: a short random opening for diversity, then engine
+// moves. Quiet engine-played positions are sampled and labelled with both the
+// game outcome (White-relative WDL) and the search score (White-relative cp).
+// Returns up to samplePerGame records of (fen, wdl, cp).
+std::vector<std::tuple<std::string, double, int>> selfplayGame(
+    uint64_t gameId, int depth, uint64_t maxNodes, int randomPlies,
+    int samplePerGame, int maxPlies) {
+    nb::gil_scoped_release release;
+
+    gSearcher.clearTT();
+    std::mt19937_64 rng(gameId * 0x9E3779B97F4A7C15ULL + 0xD1B54A32D192ED03ULL);
+    Board b = fromFen(START_FEN);
+
+    struct Candidate {
+        std::string fen;
+        int cpWhite;
+    };
+    std::vector<Candidate> candidates;
+    std::unordered_map<Bitboard, int> repetitions;
+    double resultWhite = 0.5;  // default: draw
+    Move moves[256];
+    Undo u;
+
+    for (int ply = 0;; ++ply) {
+        int n = genLegal(b, moves);
+        if (n == 0) {
+            if (inCheck(b, b.side))  // checkmate: side to move loses
+                resultWhite = (b.side == WHITE) ? 0.0 : 1.0;
+            break;  // else stalemate -> draw
+        }
+        if (b.halfmove >= 100 || insufficientMaterial(b)) break;
+        if (++repetitions[b.zobrist] >= 3 || ply >= maxPlies) break;
+
+        Move m;
+        if (ply < randomPlies) {
+            m = moves[rng() % n];
+        } else {
+            SearchResult r = gSearcher.go(b, depth, 0, maxNodes, nullptr);
+            if (!r.bestMove) break;
+            m = r.bestMove;
+            // Sample only quiet positions: not in check, best move is not a
+            // capture/promotion, and the score is not a forced mate. A static
+            // net can't represent tactics-in-flight, so these labels would
+            // mostly be noise.
+            if (!inCheck(b, b.side) && !mIsCapture(m) && !mIsPromo(m) &&
+                std::abs(r.score) < MATE_THRESHOLD) {
+                int cpWhite = (b.side == WHITE) ? r.score : -r.score;
+                cpWhite = std::clamp(cpWhite, -SELFPLAY_CP_CAP, SELFPLAY_CP_CAP);
+                candidates.push_back({toFen(b), cpWhite});
+            }
+        }
+        makeMove(b, m, u);
+    }
+
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+    if ((int)candidates.size() > samplePerGame) candidates.resize(samplePerGame);
+    std::vector<std::tuple<std::string, double, int>> out;
+    out.reserve(candidates.size());
+    for (const Candidate& c : candidates)
+        out.emplace_back(c.fen, resultWhite, c.cpWhite);
+    return out;
+}
+
+// Walk the legal move tree to `depth`, verifying at every node that the
+// incrementally-updated accumulator matches a from-scratch refresh.
+bool nnueSelfcheck(const std::string& fen, int depth) {
+    if (!gUseNnue) return false;
+    Board b = fromFen(fen);
+    std::function<bool(Board&, int)> walk = [&](Board& board, int d) -> bool {
+        int32_t fresh[NN_HIDDEN];
+        refreshAccumulator(board, fresh);
+        for (int h = 0; h < NN_HIDDEN; ++h)
+            if (fresh[h] != board.acc[h]) return false;
+        if (d == 0) return true;
+        Move moves[256];
+        int n = genLegal(board, moves);
+        Undo u;
+        for (int i = 0; i < n; ++i) {
+            makeMove(board, moves[i], u);
+            bool ok = walk(board, d - 1);
+            unmakeMove(board, moves[i], u);
+            if (!ok) return false;
+        }
+        return true;
+    };
+    return walk(b, depth);
+}
 
 }  // namespace
 
@@ -1282,10 +1515,19 @@ NB_MODULE(_core, m) {
           "Toggle between NNUE (true) and hand-crafted (false) evaluation.");
     m.def("nnue_active", []() { return gUseNnue; }, "Is NNUE eval active?");
     m.def("search", &searchFen, "fen"_a, "max_depth"_a, "movetime_ms"_a = 0,
-          "info_callback"_a = nb::none(),
+          "max_nodes"_a = 0, "info_callback"_a = nb::none(),
           "Search a position; returns {bestmove, score, depth, nodes, time}. "
+          "max_nodes (0 = unlimited) caps the searched node count. "
           "If info_callback is given, it is called once per depth with a dict "
           "{depth, score, nodes, time, pv}.");
     m.def("stop", &stopSearch, "Request the running search to stop (thread-safe).");
     m.def("new_game", &newGame, "Clear the transposition table.");
+    m.def("selfplay_game", &selfplayGame, "game_id"_a, "depth"_a, "max_nodes"_a = 0,
+          "random_plies"_a = 10, "sample_per_game"_a = 20, "max_plies"_a = 300,
+          "Play one engine self-play game (short random opening, then engine "
+          "moves) and return sampled quiet positions as (fen, wdl, cp) tuples, "
+          "White-relative. Runs entirely natively with the GIL released.");
+    m.def("nnue_selfcheck", &nnueSelfcheck, "fen"_a, "depth"_a,
+          "Verify the incremental NNUE accumulator against a full refresh over "
+          "the whole legal move tree to `depth`. Requires an active NNUE.");
 }

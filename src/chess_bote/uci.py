@@ -138,6 +138,7 @@ class UCIEngine:
         self._stop_search()
 
         max_depth = 64
+        max_nodes = 0
         movetime: float | None = None
         infinite = False
         wtime = btime = winc = binc = None
@@ -149,6 +150,9 @@ class UCIEngine:
             if t == "depth":
                 i += 1
                 max_depth = int(tokens[i])
+            elif t == "nodes":
+                i += 1
+                max_nodes = int(tokens[i])
             elif t == "movetime":
                 i += 1
                 movetime = int(tokens[i]) / 1000.0
@@ -177,10 +181,10 @@ class UCIEngine:
         if infinite:
             movetime = None
         # Plain "go" with no limits at all: a sane default so we don't run away.
-        if movetime is None and not infinite and max_depth == 64:
+        if movetime is None and not infinite and max_depth == 64 and max_nodes == 0:
             movetime = 3.0
 
-        self._start_search(max_depth, movetime)
+        self._start_search(max_depth, movetime, max_nodes)
 
     # ------------------------------------------------------------------ #
     # Time management
@@ -211,16 +215,20 @@ class UCIEngine:
     # Search thread plumbing
     # ------------------------------------------------------------------ #
 
-    def _start_search(self, max_depth: int, movetime: float | None) -> None:
+    def _start_search(
+        self, max_depth: int, movetime: float | None, max_nodes: int = 0
+    ) -> None:
         # Search a copy so the engine state can't be mutated mid-search.
         position = Board(self.board.fen())
 
         def worker() -> None:
             if self.use_native:
                 result = native.native_search(
-                    position, max_depth, movetime, on_info=self._send_native_info
+                    position, max_depth, movetime,
+                    on_info=self._send_native_info, nodes=max_nodes,
                 )
             else:
+                # The pure-Python fallback has no node limit; depth/time only.
                 result = self.searcher.search(
                     position, max_depth, movetime, info_callback=self._send_info
                 )

@@ -7,7 +7,7 @@ authors = [
     { name = "juandanielsg", email = "jdsglez@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["tqdm>=4.66"]
 
 [project.scripts]
 chess-bote = "chess_bote:main"

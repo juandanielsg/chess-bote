@@ -41,14 +41,16 @@ def native_search(
     depth: int = 64,
     movetime: float | None = None,
     on_info: Callable[[dict], None] | None = None,
+    nodes: int = 0,
 ) -> SearchResult:
     """Run the native search and adapt the result to :class:`SearchResult`.
 
+    ``nodes`` (0 = unlimited) caps the searched node count.
     ``on_info``, if given, is called once per completed depth with a dict
     ``{depth, score, nodes, time, pv}`` (``pv`` is a list of UCI move strings).
     """
     movetime_ms = int(movetime * 1000) if movetime else 0
-    r = _core.search(board.fen(), depth, movetime_ms, on_info)
+    r = _core.search(board.fen(), depth, movetime_ms, nodes, on_info)
     uci = r["bestmove"]
     move = None if uci == "0000" else parse_move(board, uci)
     return SearchResult(
@@ -70,6 +72,23 @@ def set_nnue(on: bool) -> None:
     """Toggle between NNUE (True) and hand-crafted (False) evaluation."""
     if HAS_NATIVE:
         _core.use_nnue(on)
+
+
+def selfplay_game(
+    game_id: int,
+    depth: int = 64,
+    nodes: int = 0,
+    random_plies: int = 10,
+    sample_per_game: int = 20,
+    max_plies: int = 300,
+) -> list[tuple[str, float, int]]:
+    """Play one native self-play game; see ``_core.selfplay_game``.
+
+    Returns sampled quiet positions as ``(fen, wdl, cp)`` tuples, where both
+    the WDL game outcome and the search-score cp label are White-relative.
+    """
+    return _core.selfplay_game(game_id, depth, nodes, random_plies,
+                               sample_per_game, max_plies)
 
 
 def stop() -> None:
