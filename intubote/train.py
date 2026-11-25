@@ -122,6 +122,9 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=100,
                     help="print a short progress line (speed, ETA) every N steps")
     ap.add_argument("--save-every", type=int, default=2000)
+    ap.add_argument("--keep-every", type=int, default=0,
+                    help="also keep a separate snapshot <out>_step<N>.pt every N steps "
+                         "(weights only, never overwritten; 0 = off)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--max-gpu-data-gb", type=float, default=4.0,
                     help="move the dataset to the GPU if smaller than this")
@@ -238,6 +241,20 @@ def main() -> None:
                     "args": vars(args)}, tmp)
         os.replace(tmp, args.out)
 
+    def snapshot() -> None:
+        """Keep a separate, never-overwritten copy of the current model.
+
+        Weights + config only (no optimizer state), so it is ~1/3 the size of the
+        resumable checkpoint; engine.py / uci.py load it like any checkpoint.
+        """
+        base = args.out[:-3] if args.out.endswith(".pt") else args.out
+        path = f"{base}_step{step}.pt"
+        tmp = path + ".tmp"
+        torch.save({"model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    "config": cfg.to_dict(), "step": step, "args": vars(args)}, tmp)
+        os.replace(tmp, path)
+        log(f"  snapshot kept: {path}")
+
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
     # Metrics log for plotting (plot_metrics.py): one JSON object per eval.
@@ -337,6 +354,8 @@ def main() -> None:
             hb_t0, hb_n = time.time(), 0
         if step % args.save_every == 0 or step == args.steps:
             save()
+        if args.keep_every and step % args.keep_every == 0 and step != args.steps:
+            snapshot()
 
     print(f"saved {args.out}", file=sys.stderr)
 
