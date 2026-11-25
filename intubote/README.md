@@ -9,7 +9,8 @@ It lives next to the NNUE engine (`nnue/`) and shares chess-bote's board and leg
 | Step | File | Output |
 |---|---|---|
 | Stream and encode data | `prepare_data.py` | `tokens.npy`, `moves.npy`, `wins.npy` |
-| Train (GPU, resumable) | `train.py` | `intubote.pt` checkpoint |
+| Train (GPU, resumable) | `train.py` | `intubote.pt` checkpoint + `intubote.pt.metrics.jsonl` |
+| Chart training progress | `plot_metrics.py` | accuracy / policy loss / value loss panels (live in the notebook) |
 | Ask for a move | `engine.py` | top moves + win probability |
 | Play in a GUI | `uci.py` | UCI engine |
 | Do it all on Colab | `colab_intubote.ipynb` | |

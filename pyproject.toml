@@ -39,6 +39,7 @@ intubote = [
     "numpy>=1.26",
     "zstandard>=0.22",
     "orjson>=3.9",
+    "matplotlib>=3.8",
 ]
 
 # Use the CPU-only PyTorch wheels (no CUDA) to keep the install small.

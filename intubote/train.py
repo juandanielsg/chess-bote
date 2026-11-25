@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -174,6 +175,18 @@ def main() -> None:
         os.replace(tmp, args.out)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    # Metrics log for plotting (plot_metrics.py): one JSON object per eval.
+    # A fresh run starts it over; a resumed run drops entries newer than the
+    # checkpoint (logged after the last save, before a disconnect).
+    metrics_path = args.out + ".metrics.jsonl"
+    kept_lines = []
+    if ck is not None and os.path.exists(metrics_path):
+        with open(metrics_path) as f:
+            kept_lines = [ln for ln in f if ln.strip() and json.loads(ln)["step"] <= step]
+    with open(metrics_path, "w") as f:
+        f.writelines(kept_lines)
+
     model.train()
     g = torch.Generator().manual_seed(args.seed + step)
     t0, run_p, run_v, run_n = time.time(), 0.0, 0.0, 0
@@ -200,6 +213,14 @@ def main() -> None:
                   f"value {run_v / run_n:.4f} | val policy {v['policy']:.3f} "
                   f"top1 {v['top1']:.1%} top3 {v['top3']:.1%} value_mae {v['value_mae']:.3f} "
                   f"| {rate:,.0f} pos/s", file=sys.stderr, flush=True)
+            with open(metrics_path, "a") as f:
+                f.write(json.dumps({
+                    "step": step, "lr": lr_at(step), "positions": step * args.batch,
+                    "train_policy": run_p / run_n, "train_value": run_v / run_n,
+                    "val_policy": v["policy"], "val_value": v["value"],
+                    "top1": v["top1"], "top3": v["top3"], "value_mae": v["value_mae"],
+                    "pos_per_s": rate, "time": time.time(),
+                }) + "\n")
             t0, run_p, run_v, run_n = time.time(), 0.0, 0.0, 0
         if step % args.save_every == 0 or step == args.steps:
             save()
