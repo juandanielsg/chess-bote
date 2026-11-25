@@ -79,6 +79,8 @@ def main() -> None:
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--val-frac", type=float, default=0.01)
     ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--log-every", type=int, default=100,
+                    help="print a short progress line (speed, ETA) every N steps")
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--max-gpu-data-gb", type=float, default=4.0,
@@ -189,7 +191,11 @@ def main() -> None:
 
     model.train()
     g = torch.Generator().manual_seed(args.seed + step)
-    t0, run_p, run_v, run_n = time.time(), 0.0, 0.0, 0
+    # Running losses stay on the device: calling .item() every step would force a
+    # GPU sync per step. They are read only at heartbeats and evaluations.
+    zero = lambda: torch.zeros((), device=device)  # noqa: E731
+    t0, run_p, run_v, run_n = time.time(), zero(), zero(), 0
+    hb_t0, hb_n = time.time(), 0
     while step < args.steps:
         for group in opt.param_groups:
             group["lr"] = lr_at(step)
@@ -204,11 +210,26 @@ def main() -> None:
         scaler.step(opt)
         scaler.update()
         step += 1
-        run_p, run_v, run_n = run_p + lp.item(), run_v + lv.item(), run_n + 1
+        run_p += lp.detach()
+        run_v += lv.detach()
+        run_n += 1
+        hb_n += 1
+
+        if (step % args.log_every == 0 and step % args.eval_every != 0
+                and step != args.steps):
+            # Heartbeat (deliberately not starting with "step ", which the notebook
+            # treats as "new evaluation, redraw the chart").
+            rate = hb_n * args.batch / (time.time() - hb_t0)
+            eta_min = (args.steps - step) * args.batch / rate / 60
+            eta = f"{eta_min / 60:.1f} h" if eta_min >= 90 else f"{eta_min:.0f} min"
+            print(f"  .. step {step:,}/{args.steps:,}  policy {run_p.item() / run_n:.3f}  "
+                  f"{rate:,.0f} pos/s  ETA {eta}", file=sys.stderr, flush=True)
+            hb_t0, hb_n = time.time(), 0
 
         if step % args.eval_every == 0 or step == args.steps:
-            v = evaluate()
             rate = run_n * args.batch / (time.time() - t0)
+            run_p, run_v = run_p.item(), run_v.item()
+            v = evaluate()
             print(f"step {step:7d}  lr {lr_at(step):.2e}  train policy {run_p / run_n:.3f} "
                   f"value {run_v / run_n:.4f} | val policy {v['policy']:.3f} "
                   f"top1 {v['top1']:.1%} top3 {v['top3']:.1%} value_mae {v['value_mae']:.3f} "
@@ -221,7 +242,8 @@ def main() -> None:
                     "top1": v["top1"], "top3": v["top3"], "value_mae": v["value_mae"],
                     "pos_per_s": rate, "time": time.time(),
                 }) + "\n")
-            t0, run_p, run_v, run_n = time.time(), 0.0, 0.0, 0
+            t0, run_p, run_v, run_n = time.time(), zero(), zero(), 0
+            hb_t0, hb_n = time.time(), 0
         if step % args.save_every == 0 or step == args.steps:
             save()
 
