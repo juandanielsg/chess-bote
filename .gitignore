@@ -19,3 +19,7 @@ nnue/loop_runs/
 nnue/optionc_runs/
 *.bin
 *.pt
+
+# IntuBote data (regenerable)
+intubote/data/
+*.npy

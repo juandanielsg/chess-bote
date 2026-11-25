@@ -22,6 +22,9 @@ epoch and the checkpoint with the best validation loss is the one saved.
 Usage:
     uv run --group train python nnue/train.py --data nnue/data/positions.txt \
         --epochs 40 --out nnue/net.pt
+
+Runs on the GPU automatically when one is available (``--device auto``); pass
+``--device cpu`` to force CPU. See ``nnue/colab_train.ipynb`` for Colab.
 """
 
 from __future__ import annotations
@@ -113,12 +116,16 @@ class PositionData:
 
     def batch(self, ids: np.ndarray):
         """Build (indices, offsets, primary, cp) tensors for the given samples."""
-        lengths = self.bounds[ids + 1] - self.bounds[ids]
+        starts = self.bounds[ids]
+        lengths = self.bounds[ids + 1] - starts
         offsets = np.zeros(len(ids), dtype=np.int64)
         np.cumsum(lengths[:-1], out=offsets[1:])
-        indices = np.concatenate(
-            [self.feats[self.bounds[i]:self.bounds[i + 1]] for i in ids]
+        # Vectorized gather of every sample's feature slice (no per-sample
+        # Python loop -- that loop was the bottleneck once training runs on GPU).
+        gather = np.arange(int(lengths.sum()), dtype=np.int64) + np.repeat(
+            starts - offsets, lengths
         )
+        indices = self.feats[gather]
         cp = (
             torch.from_numpy(self.cp[ids])
             if self.cp is not None
@@ -177,7 +184,24 @@ def main() -> None:
         "--val-frac", type=float, default=0.05,
         help="held-out validation fraction (0 disables; best-val model is saved)",
     )
+    ap.add_argument(
+        "--device", default="auto",
+        help="'auto' (cuda if available, else cpu), 'cuda', 'cuda:N', or 'cpu'",
+    )
     args = ap.parse_args()
+
+    if args.device == "auto":
+        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(args.device)
+    print(f"device: {device}", file=sys.stderr)
+
+    def to_dev(indices, offsets, primary, cp):
+        return (
+            indices.to(device),
+            offsets.to(device),
+            primary.to(device),
+            cp.to(device) if cp is not None else None,
+        )
 
     torch.manual_seed(args.seed)
     print(f"loading {args.data} ...", file=sys.stderr)
@@ -189,7 +213,7 @@ def main() -> None:
     n_val = int(len(ds) * args.val_frac)
     val_ids, train_ids = perm[:n_val], perm[n_val:]
 
-    model = NNUE()
+    model = NNUE().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     loss_fn = nn.MSELoss()
@@ -199,7 +223,7 @@ def main() -> None:
         with torch.no_grad():
             for s in range(0, n_val, args.batch):
                 ids = val_ids[s:s + args.batch]
-                indices, offsets, primary, cp = ds.batch(ids)
+                indices, offsets, primary, cp = to_dev(*ds.batch(ids))
                 pred_wdl = torch.sigmoid(model(indices, offsets) / WDL_SCALE)
                 target = wdl_target(args, primary, cp)
                 total += loss_fn(pred_wdl, target).item() * len(ids)
@@ -218,7 +242,7 @@ def main() -> None:
                          leave=False, file=sys.stderr)
         for s in batch_bar:
             ids = order[s:s + args.batch]
-            indices, offsets, primary, cp = ds.batch(ids)
+            indices, offsets, primary, cp = to_dev(*ds.batch(ids))
             pred_wdl = torch.sigmoid(model(indices, offsets) / WDL_SCALE)
             target = wdl_target(args, primary, cp)
             loss = loss_fn(pred_wdl, target)
@@ -236,7 +260,8 @@ def main() -> None:
             postfix["val"] = f"{v:.5f}"
             if v < best_val:
                 best_val = v
-                best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
+                best_state = {k: t.detach().cpu().clone()
+                              for k, t in model.state_dict().items()}
         epoch_bar.set_postfix(**postfix)
         print(f"epoch {epoch:3d}  train {total / n:.5f}"
               + (f"  val {postfix['val']}" if n_val else ""), file=sys.stderr)
@@ -244,7 +269,8 @@ def main() -> None:
     if best_state is not None:
         model.load_state_dict(best_state)
         print(f"best val loss {best_val:.5f}", file=sys.stderr)
-    torch.save(model.state_dict(), args.out)
+    # Always save CPU tensors so export.py / nnue_infer.py load anywhere.
+    torch.save({k: t.detach().cpu() for k, t in model.state_dict().items()}, args.out)
     print(f"saved {args.out}", file=sys.stderr)
 
 

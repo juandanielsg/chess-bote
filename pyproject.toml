@@ -33,6 +33,13 @@ train = [
     "torch>=2.2",
     "numpy>=1.26",
 ]
+# IntuBote transformer (intubote/). Install with: uv sync --group intubote
+intubote = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "zstandard>=0.22",
+    "orjson>=3.9",
+]
 
 # Use the CPU-only PyTorch wheels (no CUDA) to keep the install small.
 [[tool.uv.index]]
