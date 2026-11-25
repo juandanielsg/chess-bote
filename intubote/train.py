@@ -49,6 +49,46 @@ def load_data(path: str, device: torch.device, max_gpu_bytes: float):
     return t, m, w
 
 
+def log(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def gpu_diagnostics(device: torch.device) -> None:
+    """Print the GPU/PyTorch setup and a tiny matmul speed test per precision.
+
+    On a GPU without native bf16 (e.g. Colab's T4) the bf16 number comes out far
+    below fp16 -- which is why training uses fp16 there.
+    """
+    log(f"[check] torch {torch.__version__}, CUDA {torch.version.cuda}")
+    if device.type != "cuda":
+        log("[check] no GPU in use: training will be slow")
+        return
+    props = torch.cuda.get_device_properties(device)
+    log(f"[check] GPU {props.name}, sm {props.major}.{props.minor}, "
+        f"{props.total_memory / 1e9:.1f} GB, "
+        f"torch.cuda.is_bf16_supported()={torch.cuda.is_bf16_supported()}")
+    n, reps = 1024, 10
+    for dtype in (torch.float32, torch.float16, torch.bfloat16):
+        try:
+            a = torch.randn(n, n, device=device, dtype=dtype)
+            b = torch.randn(n, n, device=device, dtype=dtype)
+            a @ b  # warm-up
+            sync(device)
+            t = time.time()
+            for _ in range(reps):
+                a @ b
+            sync(device)
+            tflops = 2 * n ** 3 * reps / (time.time() - t) / 1e12
+            log(f"[check] matmul speed {str(dtype).replace('torch.', ''):>8}: {tflops:6.2f} TFLOPS")
+        except Exception as e:  # pragma: no cover
+            log(f"[check] matmul speed {dtype}: failed ({type(e).__name__}: {e})")
+
+
 def policy_loss(logits, moves, wins, target: str, temp: float, smoothing: float):
     if target == "best":
         return F.cross_entropy(logits, moves[:, 0], label_smoothing=smoothing)
@@ -93,6 +133,7 @@ def main() -> None:
                           else ("cpu" if args.device == "auto" else args.device))
     torch.manual_seed(args.seed)
     print(f"device: {device}", file=sys.stderr)
+    gpu_diagnostics(device)
 
     tokens, moves, wins = load_data(args.data, device, args.max_gpu_data_gb * 1e9)
     n = len(tokens)
@@ -126,7 +167,16 @@ def main() -> None:
         return args.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(t, 1.0))))
 
     use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    # bf16 only on GPUs with native bf16 tensor cores (Ampere+, compute capability
+    # >= 8). torch.cuda.is_bf16_supported() also returns True on older GPUs such as
+    # Colab's T4 (sm_75), where bf16 is merely *emulated* and very slow -- fp16 is
+    # the fast path there.
+    native_bf16 = use_amp and torch.cuda.get_device_capability(device)[0] >= 8
+    amp_dtype = torch.bfloat16 if native_bf16 else torch.float16
+    if use_amp:
+        cap = ".".join(map(str, torch.cuda.get_device_capability(device)))
+        print(f"gpu: {torch.cuda.get_device_name(device)} (sm {cap}), mixed precision "
+              f"{str(amp_dtype).replace('torch.', '')}", file=sys.stderr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
 
     step = 0
@@ -150,6 +200,18 @@ def main() -> None:
         lp = policy_loss(logits, mv, wn, args.policy_target, args.soft_temp, args.label_smoothing)
         lv = F.binary_cross_entropy_with_logits(vlogit, wn[:, 0])
         return lp, lv, logits, vlogit
+
+    # --- Startup checks: where things live and what precision actually runs. ---
+    log(f"[check] data on {tokens.device}, model on {next(model.parameters()).device}, "
+        f"weights {next(model.parameters()).dtype}")
+    with torch.no_grad():
+        probe = batch(val_ids[:8])[0]
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+            probe_out = model(probe)[0]
+    log(f"[check] forward pass OK: batch on {probe.device}, "
+        f"autocast {'on' if use_amp else 'off'}, activations computed in {probe_out.dtype}, "
+        f"grad scaler {'on' if scaler.is_enabled() else 'off'}")
+    del probe, probe_out
 
     @torch.no_grad()
     def evaluate() -> dict:
@@ -196,26 +258,55 @@ def main() -> None:
     zero = lambda: torch.zeros((), device=device)  # noqa: E731
     t0, run_p, run_v, run_n = time.time(), zero(), zero(), 0
     hb_t0, hb_n = time.time(), 0
+    start_step = step
+    print(f"training from step {step:,} to {args.steps:,} "
+          f"(first progress line at step {step + 10:,})", file=sys.stderr, flush=True)
     while step < args.steps:
+        # The first 3 steps of each session are timed phase by phase (with GPU
+        # syncs, so the times are real), to show where any slowness comes from.
+        timed = step < start_step + 3
+        marks = []
+
+        def mark(name: str) -> None:
+            if timed:
+                sync(device)
+                marks.append((name, time.time()))
+
+        mark("start")
         for group in opt.param_groups:
             group["lr"] = lr_at(step)
         ids = train_ids[torch.randint(len(train_ids), (args.batch,), generator=g)]
         tok, mv, wn = batch(ids)
+        mark("batch")
         lp, lv, _, _ = losses(tok, mv, wn)
         loss = lp + args.value_weight * lv
+        mark("forward")
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
+        mark("backward")
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
+        mark("optimizer")
         step += 1
+        if timed:
+            parts = "  ".join(f"{name} {1000 * (t - prev):.0f} ms"
+                              for (_, prev), (name, t) in zip(marks, marks[1:]))
+            total = marks[-1][1] - marks[0][1]
+            mem = (f", GPU memory {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB"
+                   if device.type == "cuda" else "")
+            log(f"[check] step {step} timing: {parts}  = {1000 * total:.0f} ms "
+                f"(~{args.batch / total:,.0f} pos/s), loss {loss.item():.3f}{mem}")
         run_p += lp.detach()
         run_v += lv.detach()
         run_n += 1
         hb_n += 1
 
-        if (step % args.log_every == 0 and step % args.eval_every != 0
+        # Progress line every --log-every steps, plus one early at step 10 of
+        # this session so the speed shows up within seconds.
+        first = step == start_step + 10
+        if ((first or step % args.log_every == 0) and step % args.eval_every != 0
                 and step != args.steps):
             # Heartbeat (deliberately not starting with "step ", which the notebook
             # treats as "new evaluation, redraw the chart").
