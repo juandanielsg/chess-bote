@@ -7,6 +7,8 @@ scales on one axis):
                     best move is the net's first / within its first three)
     Policy loss     train vs validation cross-entropy
     Value loss      train vs validation BCE on the win probability
+    Puzzles solved  share of the held-out puzzle benchmark solved with no
+                    search (only when the run used --puzzle-bench)
 
 Usage (CLI writes a PNG):
     python intubote/plot_metrics.py intubote/intubote.pt.metrics.jsonl --out progress.png
@@ -68,7 +70,9 @@ def _end_label(ax, x, y, text, color):
 
 def plot_metrics(path: str):
     rows = read_metrics(path)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.2), facecolor=SURFACE)
+    puzzles = [r for r in rows if "puzzles" in r]
+    n_panels = 4 if puzzles else 3
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4.2), facecolor=SURFACE)
     if not rows:
         fig.text(0.5, 0.5, "No evaluations logged yet", ha="center", color=TEXT_2)
         for ax in axes:
@@ -92,8 +96,18 @@ def plot_metrics(path: str):
         _line(ax, steps, [r[f"val_{key}"] for r in rows], ORANGE, "validation")
         _end_label(ax, steps[-1], last[f"val_{key}"], f"{last[f'val_{key}']:.3f}", ORANGE)
 
-    for ax in axes:
+    for ax in axes[:3]:
         ax.legend(frameon=False, fontsize=9, labelcolor=TEXT, loc="best")
+    if puzzles:
+        # One series: the title names it, so no legend box.
+        ax = axes[3]
+        _style(ax, "Puzzles solved (benchmark)")
+        _line(ax, [r["step"] for r in puzzles], [r["puzzles"] for r in puzzles], BLUE, "solved")
+        _end_label(ax, puzzles[-1]["step"], puzzles[-1]["puzzles"],
+                   f"{puzzles[-1]['puzzles']:.1%}", BLUE)
+        ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=None))
+        ax.set_ylim(bottom=0)
+    for ax in axes:
         ax.margins(x=0.08)
 
     fig.suptitle(

@@ -10,7 +10,11 @@ It lives next to the NNUE engine (`nnue/`) and shares chess-bote's board and leg
 |---|---|---|
 | Stream and encode data | `prepare_data.py` | `tokens.npy`, `moves.npy`, `wins.npy` |
 | Train (GPU, resumable) | `train.py` | `intubote.pt` checkpoint + `intubote.pt.metrics.jsonl` |
-| Chart training progress | `plot_metrics.py` | accuracy / policy loss / value loss panels (live in the notebook) |
+| Chart training progress | `plot_metrics.py` | accuracy / policy loss / value loss (/ puzzles) panels, live in the notebook |
+| Freeze a model | `export_model.py` | write-once weights file, e.g. `models/intubote_base.pt` |
+| Puzzle data + benchmark | `prepare_puzzles.py` | fine-tuning set + held-out `bench.npz` |
+| Score puzzles | `puzzle_bench.py` | solve rate by rating band and theme, models side by side |
+| Fine-tune | `train.py --init --extra` | e.g. `intubote_puzzles.pt` |
 | Ask for a move | `engine.py` | top moves + win probability |
 | Play in a GUI | `uci.py` | UCI engine |
 | Do it all on Colab | `colab_intubote.ipynb` | |
@@ -42,6 +46,24 @@ A pre-norm transformer encoder in which every square attends to every other. Two
 
 The value head is always trained against the best line's win probability.
 
+## Puzzle benchmark and fine-tuning
+
+`prepare_puzzles.py` streams the [Lichess puzzle database](https://database.lichess.org/#puzzles). Each solver move in a puzzle becomes a training position. The value target is left empty (NaN), so puzzles only train the policy.
+
+- **Held out:** 1% of puzzles, chosen by a hash of the puzzle id, are never trained on. Up to 2,000 well-established puzzles per rating band (<1000 ... 2600+) from that pool form the benchmark. Reading continues until every band is full, so the benchmark is the same whatever `--count` is.
+- **Scoring:** a puzzle is solved only if the model's top legal move is right at every solver move, with no search. On the last move any mate is accepted, as on Lichess. Because a puzzle fails at its first wrong move, scoring each move after the correct line is equivalent to playing it through, so the whole benchmark runs as one batched pass. `train.py --puzzle-bench` therefore scores it at every evaluation.
+- **Fine-tuning:** `train.py --init base.pt --extra <puzzles> --extra-frac 0.5` starts from the frozen base and mixes puzzles with base data in every batch. The validation split still comes from `--data` with the same seed, i.e. the base run's held-out positions, so the validation numbers show whether the model is forgetting normal play.
+
+```bash
+uv run python intubote/export_model.py --ckpt intubote/intubote.pt --out intubote/models/base.pt
+uv run python intubote/prepare_puzzles.py --count 200000 --out intubote/data/puzzles
+uv run python intubote/puzzle_bench.py --bench intubote/data/puzzles/bench.npz --ckpt intubote/models/base.pt
+uv run python intubote/train.py --data intubote/data/lichess200k --init intubote/models/base.pt     --extra intubote/data/puzzles --puzzle-bench intubote/data/puzzles/bench.npz     --out intubote/intubote_puzzles.pt --steps 5000 --batch 256 --lr 1e-4 --warmup 500
+uv run python intubote/puzzle_bench.py --bench intubote/data/puzzles/bench.npz     --ckpt intubote/models/base.pt intubote/intubote_puzzles.pt --themes
+```
+
+The benchmark measures the network alone, so it doesn't include `engine.py`'s mate-in-one rule.
+
 ## Local usage
 
 ```bash
@@ -60,4 +82,5 @@ Real training belongs on a GPU. See `colab_intubote.ipynb`.
 - **Tactics:** with no search, it can miss short combinations.
 - **Converting wins:** in won positions many moves look equally good, so a pure policy can dither. `engine.py` therefore plays a mate in one when one exists (UCI option `MateInOne`, on by default).
 - **No history:** the position tokens don't include repetitions or the 50-move counter.
+- **Next:** learn from its own games (Stockfish labels the positions IntuBote reaches in play, DAgger-style), then self-play with search (MCTS) once the network is strong enough.
 - **Ideas:** full action-value training (score every legal move); history tokens; using IntuBote's policy for move ordering in chess-bote's alpha-beta search.

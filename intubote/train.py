@@ -14,9 +14,23 @@ uses mixed precision, and a resumable checkpoint (model + optimizer + step) is
 written every ``--save-every`` steps, so a disconnect costs minutes, not hours.
 Re-running the same command resumes automatically from ``--out``.
 
+Fine-tuning (e.g. on puzzles from ``prepare_puzzles.py``):
+  * ``--init BASE.pt`` starts from a trained model's weights (fresh optimizer,
+    step 0). The base file is only read, never written.
+  * ``--extra DIR --extra-frac F`` mixes a second dataset into every batch
+    (fraction F of each batch). ``--data`` still supplies the rest and the
+    validation split -- with the base run's data and seed this is the same
+    held-out set, so the val numbers show whether the model is forgetting.
+    Rows whose win probability is NaN (puzzles) get no value loss.
+  * ``--puzzle-bench bench.npz`` scores the puzzle benchmark at every eval.
+
 Usage:
     python intubote/train.py --data intubote/data/lichess2m --out intubote/intubote.pt \
         --steps 50000 --batch 1024
+    python intubote/train.py --data intubote/data/lichess2m --init models/base.pt \
+        --extra intubote/data/puzzles --extra-frac 0.5 \
+        --puzzle-bench intubote/data/puzzles/bench.npz \
+        --out intubote/intubote_ft.pt --steps 20000 --lr 1e-4 --warmup 500
 """
 
 from __future__ import annotations
@@ -36,16 +50,26 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import Config, IntuBote, num_params  # noqa: E402
 
 
-def load_data(path: str, device: torch.device, max_gpu_bytes: float):
+def load_data(path: str, device: torch.device, max_gpu_bytes: float, k: int | None = None,
+              label: str = "data"):
+    """Load a prepared dataset; with ``k``, pad/trim the candidate columns to k."""
     tokens = np.load(os.path.join(path, "tokens.npy"))
     moves = np.load(os.path.join(path, "moves.npy"))
     wins = np.load(os.path.join(path, "wins.npy")).astype(np.float32)
+    if k is not None and moves.shape[1] != k:
+        pad = k - moves.shape[1]
+        if pad > 0:
+            moves = np.pad(moves, ((0, 0), (0, pad)), constant_values=-1)
+            wins = np.pad(wins, ((0, 0), (0, pad)), constant_values=np.nan)
+        else:
+            moves, wins = moves[:, :k], wins[:, :k]
     nbytes = tokens.nbytes + moves.nbytes + wins.nbytes
     where = device if (device.type == "cuda" and nbytes <= max_gpu_bytes) else torch.device("cpu")
     t = torch.from_numpy(tokens).to(where)
     m = torch.from_numpy(moves.astype(np.int64)).to(where)
     w = torch.from_numpy(wins).to(where)
-    print(f"data: {len(t):,} positions, {nbytes / 1e6:.0f} MB, kept on {where}", file=sys.stderr)
+    print(f"{label}: {len(t):,} positions, {nbytes / 1e6:.0f} MB, kept on {where}",
+          file=sys.stderr)
     return t, m, w
 
 
@@ -90,14 +114,26 @@ def gpu_diagnostics(device: torch.device) -> None:
 
 
 def policy_loss(logits, moves, wins, target: str, temp: float, smoothing: float):
+    best = F.cross_entropy(logits, moves[:, 0], label_smoothing=smoothing, reduction="none")
     if target == "best":
-        return F.cross_entropy(logits, moves[:, 0], label_smoothing=smoothing)
+        return best.mean()
     valid = moves >= 0
-    scores = torch.where(valid, wins / temp, torch.full_like(wins, -1e9))
+    scores = torch.where(valid, torch.nan_to_num(wins) / temp, torch.full_like(wins, -1e9))
     probs = torch.softmax(scores, dim=1)  # over the K candidates
     logp = F.log_softmax(logits.float(), dim=1)
     picked = torch.gather(logp, 1, moves.clamp(min=0))
-    return -(probs * picked * valid).sum(1).mean()
+    soft = -(probs * picked * valid).sum(1)
+    # Rows without win probabilities (puzzles) have one right move: use it.
+    return torch.where(torch.isfinite(wins[:, 0]), soft, best).mean()
+
+
+def value_loss(vlogit, wins):
+    """BCE on the best move's win probability, skipping rows that have none (NaN)."""
+    target = wins[:, 0]
+    has = torch.isfinite(target)
+    per_row = F.binary_cross_entropy_with_logits(vlogit, torch.nan_to_num(target),
+                                                 reduction="none")
+    return (per_row * has).sum() / has.sum().clamp(min=1)
 
 
 def main() -> None:
@@ -130,6 +166,12 @@ def main() -> None:
                     help="move the dataset to the GPU if smaller than this")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-resume", action="store_true", help="ignore an existing --out checkpoint")
+    ap.add_argument("--init", help="start from this model's weights (fine-tuning); "
+                                   "ignored when resuming --out")
+    ap.add_argument("--extra", help="second dataset mixed into every batch (e.g. puzzles)")
+    ap.add_argument("--extra-frac", type=float, default=0.5,
+                    help="fraction of each batch taken from --extra")
+    ap.add_argument("--puzzle-bench", help="bench.npz from prepare_puzzles.py: score it at every eval")
     args = ap.parse_args()
 
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available()
@@ -140,6 +182,13 @@ def main() -> None:
 
     tokens, moves, wins = load_data(args.data, device, args.max_gpu_data_gb * 1e9)
     n = len(tokens)
+    n_extra_batch = 0
+    if args.extra:
+        x_tokens, x_moves, x_wins = load_data(args.extra, device, args.max_gpu_data_gb * 1e9,
+                                              k=moves.shape[1], label="extra data")
+        n_extra_batch = min(args.batch, max(1, round(args.batch * args.extra_frac)))
+        log(f"each batch: {args.batch - n_extra_batch} from --data + "
+            f"{n_extra_batch} from --extra")
     perm = torch.from_numpy(np.random.default_rng(args.seed).permutation(n))
     n_val = max(1, int(n * args.val_frac))
     val_ids, train_ids = perm[:n_val], perm[n_val:]
@@ -150,9 +199,17 @@ def main() -> None:
         ck = torch.load(args.out, map_location="cpu", weights_only=False)
         cfg = Config(**ck["config"])
         print(f"resuming {args.out} at step {ck['step']}", file=sys.stderr)
+    elif args.init:
+        init = torch.load(args.init, map_location="cpu", weights_only=False)
+        cfg = Config(**init["config"])
+        print(f"initializing from {args.init} (trained {init.get('step', '?')} steps)",
+              file=sys.stderr)
     else:
         cfg = Config(d_model=args.d_model, layers=args.layers, heads=args.heads)
     model = IntuBote(cfg).to(device)
+    if ck is None and args.init:
+        model.load_state_dict(init["model"])
+        del init
     print(f"model: {cfg.to_dict()}  {num_params(model) / 1e6:.1f}M params", file=sys.stderr)
 
     decay = [p for p in model.parameters() if p.dim() >= 2]
@@ -190,18 +247,37 @@ def main() -> None:
             scaler.load_state_dict(ck["scaler"])
         step = ck["step"]
 
-    def batch(ids: torch.Tensor):
-        ids_d = ids.to(tokens.device)
-        return (tokens[ids_d].to(device, non_blocking=True),
-                moves[ids_d].to(device, non_blocking=True),
-                wins[ids_d].to(device, non_blocking=True))
+    def batch(ids: torch.Tensor, src=None):
+        t, m, w = src or (tokens, moves, wins)
+        ids_d = ids.to(t.device)
+        return (t[ids_d].to(device, non_blocking=True),
+                m[ids_d].to(device, non_blocking=True),
+                w[ids_d].to(device, non_blocking=True))
+
+    def train_batch(g: torch.Generator):
+        n_main = args.batch - n_extra_batch
+        parts = []
+        if n_main:
+            parts.append(batch(train_ids[torch.randint(len(train_ids), (n_main,), generator=g)]))
+        if n_extra_batch:
+            ids = torch.randint(len(x_tokens), (n_extra_batch,), generator=g)
+            parts.append(batch(ids, (x_tokens, x_moves, x_wins)))
+        if len(parts) == 1:
+            return parts[0]
+        return tuple(torch.cat(cols) for cols in zip(*parts))
+
+    bench = None
+    if args.puzzle_bench:
+        from puzzle_bench import Bench, evaluate as bench_eval
+        bench = Bench(args.puzzle_bench, device)
+        log(f"puzzle benchmark: {bench.n_puzzles:,} puzzles, {len(bench.tokens):,} positions")
 
     def losses(tok, mv, wn):
         with torch.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
             logits, vlogit = model(tok)
         logits, vlogit = logits.float(), vlogit.float()
         lp = policy_loss(logits, mv, wn, args.policy_target, args.soft_temp, args.label_smoothing)
-        lv = F.binary_cross_entropy_with_logits(vlogit, wn[:, 0])
+        lv = value_loss(vlogit, wn)
         return lp, lv, logits, vlogit
 
     # --- Startup checks: where things live and what precision actually runs. ---
@@ -292,8 +368,7 @@ def main() -> None:
         mark("start")
         for group in opt.param_groups:
             group["lr"] = lr_at(step)
-        ids = train_ids[torch.randint(len(train_ids), (args.batch,), generator=g)]
-        tok, mv, wn = batch(ids)
+        tok, mv, wn = train_batch(g)
         mark("batch")
         lp, lv, _, _ = losses(tok, mv, wn)
         loss = lp + args.value_weight * lv
@@ -338,18 +413,24 @@ def main() -> None:
             rate = run_n * args.batch / (time.time() - t0)
             run_p, run_v = run_p.item(), run_v.item()
             v = evaluate()
+            pz = bench_eval(model, bench) if bench is not None else None
+            pz_text = f" | puzzles {pz['puzzles']:.1%}" if pz else ""
             print(f"step {step:7d}  lr {lr_at(step):.2e}  train policy {run_p / run_n:.3f} "
                   f"value {run_v / run_n:.4f} | val policy {v['policy']:.3f} "
-                  f"top1 {v['top1']:.1%} top3 {v['top3']:.1%} value_mae {v['value_mae']:.3f} "
-                  f"| {rate:,.0f} pos/s", file=sys.stderr, flush=True)
+                  f"top1 {v['top1']:.1%} top3 {v['top3']:.1%} value_mae {v['value_mae']:.3f}"
+                  f"{pz_text} | {rate:,.0f} pos/s", file=sys.stderr, flush=True)
+            row = {
+                "step": step, "lr": lr_at(step), "positions": step * args.batch,
+                "train_policy": run_p / run_n, "train_value": run_v / run_n,
+                "val_policy": v["policy"], "val_value": v["value"],
+                "top1": v["top1"], "top3": v["top3"], "value_mae": v["value_mae"],
+                "pos_per_s": rate, "time": time.time(),
+            }
+            if pz:
+                row.update(puzzles=pz["puzzles"], puzzle_moves=pz["puzzle_moves"],
+                           puzzle_bands=pz["bands"])
             with open(metrics_path, "a") as f:
-                f.write(json.dumps({
-                    "step": step, "lr": lr_at(step), "positions": step * args.batch,
-                    "train_policy": run_p / run_n, "train_value": run_v / run_n,
-                    "val_policy": v["policy"], "val_value": v["value"],
-                    "top1": v["top1"], "top3": v["top3"], "value_mae": v["value_mae"],
-                    "pos_per_s": rate, "time": time.time(),
-                }) + "\n")
+                f.write(json.dumps(row) + "\n")
             t0, run_p, run_v, run_n = time.time(), zero(), zero(), 0
             hb_t0, hb_n = time.time(), 0
         if step % args.save_every == 0 or step == args.steps:
